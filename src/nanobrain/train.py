@@ -338,6 +338,17 @@ def main(args: DictConfig):
     # load checkpoint/resume training
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
+    # weight averaging (off unless ema_taus is set): an fp32 copy of every parameter per window of tau optimizer
+    # steps, updated every ema_every steps, saved as checkpoint-ema<tau>.pth at the end. not restored on resume: a
+    # resumed run restarts the averages from its current weights and marks their files resumed
+    ema = None
+    if args.get("ema_taus"):
+        ema = WeightEMA(model_without_ddp, args.ema_taus, args.get("ema_every") or 1, resumed=start_step > 0)
+        logger.info(
+            f"ema: windows {ema.taus} steps, updated every {ema.every} steps, {ema.numel / 1e6:.1f}M params each"
+            + (" (resumed run: the averages restart here)" if start_step > 0 else "")
+        )
+
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
     late_indices = switch_at = None
     if args.anneal_filelist:
@@ -478,6 +489,7 @@ def main(args: DictConfig):
         batch_flops,
         stop_event,
         native_cudagraphs,
+        ema=ema,
     )
 
     if args.distributed:
@@ -550,6 +562,7 @@ def train(
     batch_flops: float,
     stop_event: threading.Event,
     native_cudagraphs: bool = False,
+    ema: "WeightEMA | None" = None,
 ) -> dict:
     model.train()
 
@@ -748,6 +761,9 @@ def train(
             # compile is done: later gen 2 collections skip the startup objects
             gc.collect()
             gc.freeze()
+        if ema is not None:
+            # after this step's optimizer update (misc.backward_step), on the training stream
+            ema.update(step)
         wall_time = prev_wall_time + time.monotonic() - start_time
         if train_t0 is None:
             train_t0 = wall_time
@@ -778,6 +794,8 @@ def train(
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
             misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
+            if ema is not None and is_last:
+                ema.save(args, step, model_without_ddp)
 
         if is_last:
             break
@@ -867,6 +885,55 @@ def nice_worker(worker_id: int, nice: int = 0):
     # training process' threads win the cpus they share
     ignore_sigterm(worker_id)
     os.nice(nice)
+
+
+class WeightEMA:
+    """Exponential moving averages of a model's parameters (config: ema_taus, ema_every).
+
+    One fp32 copy of every parameter per averaging window tau, in optimizer steps. Every `every` steps each copy
+    moves every / tau of the way to the live weights. save() writes each average as checkpoint-ema<tau>.pth in the
+    format the eval loads (the model state dict with the averages in place of the parameters, plus args)."""
+
+    def __init__(self, model: nn.Module, taus, every: int = 1, resumed: bool = False):
+        self.params = list(model.parameters())
+        assert all(p.dtype == torch.float32 for p in self.params), "ema: fp32 parameters only"
+        self.taus = [int(t) for t in taus]
+        self.every = int(every)
+        assert self.every >= 1 and all(t > self.every for t in self.taus), (self.taus, self.every)
+        self.resumed = resumed
+        self.numel = sum(p.numel() for p in self.params)
+        with torch.no_grad():
+            self.copies = {t: [p.detach().clone() for p in self.params] for t in self.taus}
+
+    @torch.no_grad()
+    def update(self, step: int) -> None:
+        if step % self.every:
+            return
+        for tau, copy in self.copies.items():
+            torch._foreach_lerp_(copy, self.params, self.every / tau)
+
+    def save(self, args: DictConfig, step: int, model: nn.Module) -> None:
+        # state dict entries that are parameters (matched by storage) take the average; buffers stay as they are
+        index = {p.data_ptr(): i for i, p in enumerate(self.params) if p.numel()}
+        state = model.state_dict()
+        hit = {index[v.data_ptr()] for v in state.values() if v.numel() and v.data_ptr() in index}
+        assert len(hit) == len(index), f"ema: {len(index) - len(hit)} parameters missing from the state dict"
+        for tau, copy in self.copies.items():
+            sd = {k: copy[index[v.data_ptr()]] if v.numel() and v.data_ptr() in index else v for k, v in state.items()}
+            path = Path(args.output_dir) / f"checkpoint-ema{tau}.pth"
+            logger.info(f"saving ema checkpoint {path}")
+            misc.save_on_master(
+                {
+                    "model": sd,
+                    "args": OmegaConf.to_container(args),
+                    "step": step,
+                    "ema_tau": tau,
+                    "ema_every": self.every,
+                    "resumed": self.resumed,
+                    "git": misc.git_info(),
+                },
+                path,
+            )
 
 
 def time_keyed_lr(

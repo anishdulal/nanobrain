@@ -1,3 +1,4 @@
+import logging
 import math
 from functools import lru_cache
 
@@ -22,9 +23,16 @@ from .data import (
     resample_to_spacing,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ViTMAE3D(nn.Module):
     name = "vit_mae_3d"
+    # eval readouts of the global embedding (test-time embedding tricks: the README allows them, but they "lose style
+    # points"). last: the final layer's token mean (the default). cat4: the token means of the last 4 blocks, each
+    # through the final norm, concatenated (4 x embed_dim). meanmax: the final layer's token mean and token max,
+    # concatenated (2 x embed_dim). the dense embedding is the final layer in every readout
+    READOUTS = ("last", "cat4", "meanmax")
 
     def __init__(
         self,
@@ -1121,6 +1129,26 @@ class ViTMAE3D(nn.Module):
             x = block(x)
         x = self.norm(x)
         return x
+
+    def encode_tokens_last(
+        self,
+        x: Float[Tensor, "B N D"],
+        coord: Float[Tensor, "B N 3"],
+        num: int,
+    ) -> list[Tensor]:
+        # eval readout cat4: encode_tokens (no pos_hide, not training) returning the outputs of the last num blocks,
+        # each through the final norm. the last entry is encode_tokens' own output (the same ops in the same order)
+        assert not self.training
+        B = x.shape[0]
+        x = self.pos_embed(x, coord)
+        if self.class_tokens:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        outs = []
+        for ii, block in enumerate(self.blocks):
+            x = block(x)
+            if ii >= len(self.blocks) - num:
+                outs.append(self.norm(x))
+        return outs
 
     def encode_tokens_fused(
         self,
@@ -2346,16 +2374,32 @@ class ViTMAE3D(nn.Module):
             sample = self.transform_cuda(sample)
             patches = patchify3d(sample["image"][None], self.patch_size[0])
             in_mask = (patchify3d(sample["mask"][None], self.patch_size[0]) > 0).any(dim=2)[0]
+            readout = getattr(self, "readout", "last")
             # cudnn attention builds a new graph (~45 ms) for each new sequence length
             with (
                 sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]),
                 torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
             ):
-                tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
+                if readout == "cat4":
+                    layers = self.encode_tokens_last(
+                        self.patch_embed(patches[:, in_mask]), self.coord_grid[:, in_mask], 4
+                    )
+                    tokens = layers[-1]
+                else:
+                    tokens = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
             tokens = tokens[0, self.class_tokens :].float()
+            if readout == "cat4":
+                global_embedding = torch.cat([h[0, self.class_tokens :].float().mean(dim=0) for h in layers])
+            elif readout == "meanmax":
+                global_embedding = torch.cat([tokens.mean(dim=0), tokens.amax(dim=0)])
+            else:
+                global_embedding = tokens.mean(dim=0)
+            if not getattr(self, "_readout_logged", False):
+                logger.info(f"readout {readout}: global embedding {tuple(global_embedding.shape)}")
+                self._readout_logged = True
 
             output = EmbeddingOutput(
-                global_embedding=tokens.mean(dim=0),
+                global_embedding=global_embedding,
                 dense_embedding=None,
                 dense_affine=None,
                 dense_mask=None,
@@ -2371,11 +2415,13 @@ class ViTMAE3D(nn.Module):
 
 
 @register_model
-def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
+def vit_mae_3d(checkpoint: str, random_weights: bool = False, readout: str = "last") -> ViTMAE3D:
+    assert readout in ViTMAE3D.READOUTS, f"readout={readout}: one of {ViTMAE3D.READOUTS}"
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model = ViTMAE3D.from_config(ckpt["args"])
     if not random_weights:
         model.load_state_dict(ckpt["model"])
+    model.readout = readout
     return model
 
 
