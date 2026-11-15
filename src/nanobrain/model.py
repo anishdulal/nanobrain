@@ -219,6 +219,14 @@ class ViTMAE3D(nn.Module):
         # subject = batch images 2k <-> 2k+1 (one subject, train.py's subject-pair sampler)
         gdist_weight: float = 0.0,
         gdist_pairs: str = "sample",
+        # gdist variants (all off = the gdist above, bitwise):
+        # gdist_pairs=subject_nodup: single-image subjects are paired with each other instead of with themselves,
+        #   and those pairs are left out of the loss (needs the per-image subject ids)
+        # gdist_std: z is divided by its per-dimension batch sd (stop-grad) before the predictor and the cosine,
+        #   the per-dimension standardised space a StandardScaler probe reads
+        # gdist_clean: z pools the clean visible tokens only (unified label 0), as the eval embedding is clean
+        gdist_std: bool = False,
+        gdist_clean: bool = False,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -486,7 +494,8 @@ class ViTMAE3D(nn.Module):
                 nn.init.zeros_(proj.bias)
         # objective round heads (under fork_rng: every other weight and the rng stream as with them off)
         self.xlat_weight, self.gdist_weight, self.gdist_pairs = float(xlat_weight), float(gdist_weight), gdist_pairs
-        assert gdist_pairs in ("sample", "subject"), "gdist_pairs: sample | subject"
+        assert gdist_pairs in ("sample", "subject", "subject_nodup"), "gdist_pairs: sample | subject | subject_nodup"
+        self.gdist_std, self.gdist_clean = bool(gdist_std), bool(gdist_clean)
         self.xlat_head = self.gdist_pred = None
         with torch.random.fork_rng(devices=[]):
             if self.xlat_weight:
@@ -1810,7 +1819,7 @@ class ViTMAE3D(nn.Module):
         if self.training and any(h is not None for h in aux_on):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
         if self.training and (self.xlat_head is not None or self.gdist_pred is not None):
-            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible)
+            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids)
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
@@ -2297,7 +2306,8 @@ class ViTMAE3D(nn.Module):
         return loss
 
     def obj_losses(
-        self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int
+        self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int,
+        subject_ids: Tensor | None = None,
     ) -> Tensor:
         # the objective-round losses (training only); stats merged into self.aux_stats
         loss, stats = embeds.new_zeros((), dtype=torch.float32), {}
@@ -2325,8 +2335,17 @@ class ViTMAE3D(nn.Module):
             loss = loss + self.xlat_weight * xl
             stats["xlat_loss"], stats["xlat_frac"] = xl.detach(), w.mean().detach()
         if self.gdist_pred is not None:
-            z = tokens.float().mean(1)
+            if self.gdist_clean and "unified_label" in parts[0]:
+                # a corrupted visible token shows a donor / transform, not the host: left out of the pool
+                keep = torch.cat([p["unified_label"] for p in parts]).reshape(tokens.shape[0], -1) == 0
+                keep = keep.float()[..., None]
+                z = (tokens.float() * keep).sum(1) / keep.sum(1).clamp_min(1.0)
+            else:
+                z = tokens.float().mean(1)
             z = z - z.mean(0, keepdim=True).detach()
+            if self.gdist_std:
+                z = z / z.std(0, keepdim=True).detach().clamp_min(1e-3)
+            valid = None
             if self.gdist_pairs == "sample":
                 assert S == 2, "gdist_pairs=sample: num_samples 2"
                 partner = torch.arange(z.shape[0], device=z.device) ^ 1
@@ -2335,7 +2354,18 @@ class ViTMAE3D(nn.Module):
                 img = [ii for p in parts for ii in p["ids"]]
                 row = {(ii, s): r for r, (ii, s) in enumerate((ii, s) for ii in img for s in range(S))}
                 partner = torch.tensor([row[(ii ^ 1, s)] for ii in img for s in range(S)]).to(z.device, non_blocking=True)
-            gd = 1.0 - F.cosine_similarity(self.gdist_pred(z).float(), z[partner].detach(), dim=-1).mean()
+                if self.gdist_pairs == "subject_nodup":
+                    # two single-image subjects share a pair of batch slots: no positive, no loss
+                    assert subject_ids is not None, "gdist_pairs=subject_nodup: needs the subject ids"
+                    subj = subject_ids.to(z.device, non_blocking=True)
+                    subj = subj[torch.tensor([ii for ii in img for _ in range(S)]).to(z.device, non_blocking=True)]
+                    valid = (subj == subj[partner]).float()
+            if valid is None:
+                gd = 1.0 - F.cosine_similarity(self.gdist_pred(z).float(), z[partner].detach(), dim=-1).mean()
+            else:
+                cos = F.cosine_similarity(self.gdist_pred(z).float(), z[partner].detach(), dim=-1)
+                gd = 1.0 - (cos * valid).sum() / valid.sum().clamp_min(1.0)
+                stats["gdist_valid"] = valid.mean().detach()
             loss = loss + self.gdist_weight * gd
             stats["gdist_loss"] = gd.detach()
             stats["gdist_cos"] = F.cosine_similarity(z, z[partner], dim=-1).mean().detach()

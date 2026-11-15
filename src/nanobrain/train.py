@@ -290,14 +290,16 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
-    if float(args.model_kwargs.get("scanmatch_weight", 0.0) or 0.0) > 0.0:
-        # same-scan matching masks same-subject scans out of the negatives (subject tempering's key)
+    gdist_nodup = bool(args.model_kwargs.get("gdist_weight")) and args.model_kwargs.get("gdist_pairs") == "subject_nodup"
+    if float(args.model_kwargs.get("scanmatch_weight", 0.0) or 0.0) > 0.0 or gdist_nodup:
+        # same-scan matching masks same-subject scans out of the negatives (subject tempering's key);
+        # gdist_pairs=subject_nodup leaves pairs of two subjects out of its loss
         from nanobrain.data import subject_counts
 
         keys, _ = subject_counts(dataset.paths)
         index = {}
         dataset.subject_ids = np.array([index.setdefault(k, len(index)) for k in keys], dtype=np.int64)
-        logger.info(f"scanmatch: {len(index)} subject keys for negative masking")
+        logger.info(f"scanmatch / gdist nodup: {len(index)} subject keys")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -334,6 +336,14 @@ def main(args: DictConfig):
         loss_scaler = torch.GradScaler(device.type)
     else:
         loss_scaler = None
+
+    # natinit.wd_to_init (off unless set): the pretrained encoder matrices decay toward their natural-image values
+    # instead of toward zero. the copies are taken here, before a resume overwrites the weights (natinit runs at
+    # every model creation), so a resumed run pulls toward the same values
+    init_pull = None
+    if args.get("natinit") and args.natinit.enabled and args.natinit.get("wd_to_init", False):
+        init_pull = InitPull(model_without_ddp, optimizer)
+        logger.info(f"natinit wd_to_init: {init_pull.numel / 1e6:.1f}M params in {len(init_pull.init)} tensors")
 
     # load checkpoint/resume training
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
@@ -388,14 +398,14 @@ def main(args: DictConfig):
         keys = spacing_keys(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
         sampler = BucketSampler(sampler, keys, args.batch_size, int(args.native_bucket_window), seed=args.seed)
         logger.info(f"bucket sampler: windows of {args.native_bucket_window} batches, {len(set(keys.tolist()))} spacing keys")
-    if args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") == "subject":
+    if args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") in ("subject", "subject_nodup"):
         # objective round: batch images 2k, 2k + 1 from one subject (data.SubjectPairSampler); the base draws half
         from nanobrain.data import SubjectPairSampler, subject_counts
 
         assert args.batch_size % 2 == 0 and world_size == 1 and not args.get("native_bucket_window"), "subject pairs"
         sampler.start //= 2
-        sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
-        logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
+        sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed, nodup=gdist_nodup)
+        logger.info(f"gdist subject pairs: batch images 2k, 2k + 1 share a subject (nodup {gdist_nodup})")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -486,6 +496,7 @@ def main(args: DictConfig):
         batch_flops,
         stop_event,
         native_cudagraphs,
+        init_pull=init_pull,
     )
 
     if args.distributed:
@@ -558,6 +569,7 @@ def train(
     batch_flops: float,
     stop_event: threading.Event,
     native_cudagraphs: bool = False,
+    init_pull: "InitPull | None" = None,
 ) -> dict:
     model.train()
 
@@ -767,6 +779,9 @@ def train(
         if not need_update:
             continue
         step += 1
+        if init_pull is not None:
+            # right after this step's optimizer update, before the weight average reads the weights
+            init_pull.apply()
         if avg_p is not None:
             live = [p.detach() for p in params]
             if wavg == "ema":
@@ -908,6 +923,51 @@ def nice_worker(worker_id: int, nice: int = 0):
     # training process' threads win the cpus they share
     ignore_sigterm(worker_id)
     os.nice(nice)
+
+
+class InitPull:
+    """natinit.wd_to_init: decoupled weight decay toward the natural-image init (L2-SP), pretrained encoder only.
+
+    Muon and AdamW decay each parameter as p <- p (1 - lr wd) inside their step. After each update this adds
+    lr wd p0 back to every pretrained parameter (p0: its value after natinit), so together the step decays p - p0
+    instead of p: p <- p - lr wd (p - p0) - lr update. lr and wd are read from the parameter's current optimizer
+    group at apply time, so block_lr_mult and layer_decay apply as they do to the decay itself. Parameters without
+    weight decay (biases, norms, gammas) are skipped, as the optimizers skip them. Costs one fp32 copy of each
+    pretrained matrix (~85M params on ViT-B) and one foreach add per step."""
+
+    def __init__(self, model: nn.Module, optimizer):
+        from nanobrain.natinit import is_natinit_param
+
+        self.optimizer = optimizer
+        name_of = {id(p): n for n, p in model.named_parameters()}
+        self.init = {}  # id(param) -> fp32 copy of its natinit value
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                if group.get("wd_multiplier", 1.0) == 0.0:
+                    continue
+                for p in group["params"]:
+                    if is_natinit_param(name_of.get(id(p), "")):
+                        assert p.dtype == torch.float32, "wd_to_init: fp32 parameters only"
+                        self.init[id(p)] = p.detach().clone()
+        assert self.init, "wd_to_init: no pretrained parameter with weight decay"
+        self.numel = sum(t.numel() for t in self.init.values())
+        self.plan = None
+
+    @torch.no_grad()
+    def apply(self):
+        if self.plan is None:
+            # bound at the first step, to the optimizer's CURRENT groups: a resume's load_state_dict replaces the
+            # group dicts, and update_lr writes the per-step lr into the new ones
+            self.plan = []
+            for group in self.optimizer.param_groups:
+                ps = [p for p in group["params"] if id(p) in self.init]
+                if ps:
+                    self.plan.append((group, ps, [self.init[id(p)] for p in ps]))
+            assert sum(len(ps) for _, ps, _ in self.plan) == len(self.init), "wd_to_init: parameters left the groups"
+        for group, params, inits in self.plan:
+            a = group["lr"] * group["weight_decay"]
+            if a:
+                torch._foreach_add_(params, inits, alpha=a)
 
 
 def time_keyed_lr(

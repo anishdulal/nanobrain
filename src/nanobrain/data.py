@@ -157,10 +157,12 @@ class InfiniteSampler(Sampler[int]):
 
 class SubjectPairSampler(Sampler[int]):
     """gdist_pairs=subject (objective round): each draw of the base sampler is followed by a uniform OTHER image of
-    its subject (itself if it has none), so batch positions 2k, 2k + 1 hold one subject. Set base.start to half."""
+    its subject (itself if it has none), so batch positions 2k, 2k + 1 hold one subject. Set base.start to half.
+    nodup (gdist_pairs=subject_nodup): a single-image subject is not doubled; it waits for the next single-image
+    draw and the two fill one pair of positions (two subjects: the model leaves that pair out of the loss)."""
 
-    def __init__(self, base: Sampler, keys: list[str], seed: int = 0):
-        self.base, self.seed = base, seed
+    def __init__(self, base: Sampler, keys: list[str], seed: int = 0, nodup: bool = False):
+        self.base, self.seed, self.nodup = base, seed, nodup
         groups: dict[str, list[int]] = {}
         for ii, key in enumerate(keys):
             groups.setdefault(key, []).append(ii)
@@ -169,12 +171,18 @@ class SubjectPairSampler(Sampler[int]):
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + 7919 * int(getattr(self.base, "start", 0)))
+        single = None
         for ii in self.base:
             m = self.members[ii]
             jj = ii
             if len(m) > 1:
                 jj = int(m[rng.integers(len(m) - 1)])
                 jj = int(m[-1]) if jj == ii else jj
+            elif self.nodup:
+                if single is None:
+                    single = ii
+                    continue
+                ii, jj, single = single, ii, None
             yield ii
             yield jj
 
