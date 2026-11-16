@@ -134,9 +134,20 @@ def main(args: DictConfig):
             Path(args.train_filelist).read_text().split(),
             DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
         )
+    n_groups = 0
+    mk = args.model_kwargs
+    if mk.get("gdist_center", "batch") == "collection" or float(mk.get("cmm_weight", 0.0) or 0.0):
+        # round 17 (off when unset): each image's (collection, contrast) group as fino meta column 7 (-1 = none)
+        from nanobrain.data import collection_groups
+
+        assert fino_meta is not None, "gdist_center / cmm_weight: fino3d (its meta carries the contrast and the group)"
+        col, n_groups, info = collection_groups(Path(args.train_filelist).read_text().split(), fino_meta[:, 6])
+        fino_meta = torch.cat([fino_meta, col[:, None]], dim=1)
+        logger.info(info)
 
     # model
     model = ViTMAE3D.from_config(args)
+    model.n_groups = n_groups
     model.decoder_prune_last = args.decoder_prune_last
     # speed (off when unset): the unified corruptions of every spacing group in one batched pass
     model.batched_corrupt = bool(args.get("native_batched_corrupt", False))
@@ -391,6 +402,25 @@ def main(args: DictConfig):
             f"subject cap sampling: cap {args.subject_cap} soft {args.get('subject_cap_soft', True)}, "
             f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
+        )
+    if args.get("collection_temper"):
+        # round 17 (off when unset): each collection's total draw mass m -> m^(1 - alpha), on the weights above
+        from nanobrain.data import collection_keys
+
+        colls = collection_keys(dataset.paths)
+        w = sampler.weights if sampler.weights is not None else torch.ones(len(dataset), dtype=torch.float64)
+        mass: dict[str, float] = {}
+        for coll, wi in zip(colls, w.tolist()):
+            mass[coll] = mass.get(coll, 0.0) + wi
+        alpha = float(args.collection_temper)
+        sampler.weights = w * torch.tensor([mass[c] ** -alpha for c in colls], dtype=torch.float64)
+
+        def n_coll(m: dict[str, float]) -> float:
+            return sum(m.values()) ** 2 / sum(v * v for v in m.values())
+
+        logger.info(
+            f"collection tempered sampling: alpha {alpha}, effective collections "
+            f"{n_coll(mass):.1f} -> {n_coll({c: v ** (1.0 - alpha) for c, v in mass.items()}):.1f} of {len(mass)}"
         )
     if args.get("native_bucket_window"):
         # speed, CHANGES BATCH COMPOSITION (off when unset): windows of native_bucket_window batches sorted by

@@ -83,6 +83,44 @@ def subject_counts(paths: list[str]) -> tuple[list[str], torch.Tensor]:
     return keys, torch.tensor([counts[key] for key in keys], dtype=torch.float64)
 
 
+def collection_keys(paths: list[str]) -> list[str]:
+    """Collection of every path: the segments between derivatives/ and the first sub-* segment (where
+    subject_counts cuts the subject key), e.g. PT030_OpenNeuro/ds001226 or PT035_Yale_Brain_Mets_Longitudinal."""
+    keys = []
+    for path in paths:
+        parts = path.split("/")
+        cut = next((ii for ii, part in enumerate(parts) if part.startswith("sub")), 2)
+        keys.append("/".join(parts[1:cut]))
+    return keys
+
+
+# round 17: a (collection, contrast) group needs this many distinct subjects, else its images get no group (-1):
+# in a small group the EMA mean is mostly the image's own subject
+GROUP_MIN_SUBJECTS = 20
+
+
+def collection_groups(paths: list[str], seqtype: torch.Tensor) -> tuple[torch.Tensor, int, str]:
+    """Per image the id of its (collection, contrast) group as a float (-1 = none), the number of groups, a log
+    line. seqtype: fino meta column 6 (NaN where fino masks the image: exclude_collections)."""
+    colls = collection_keys(paths)
+    subj, _ = subject_counts(paths)
+    seq = seqtype.numpy()
+    keys, members = [], {}
+    for coll, s, sb in zip(colls, seq, subj):
+        key = None if np.isnan(s) else (coll, int(s))
+        keys.append(key)
+        if key is not None:
+            members.setdefault(key, set()).add(sb)
+    keep = sorted(k for k, v in members.items() if len(v) >= GROUP_MIN_SUBJECTS)
+    gid = {k: float(ii) for ii, k in enumerate(keep)}
+    col = torch.tensor([gid.get(k, -1.0) if k is not None else -1.0 for k in keys], dtype=torch.float32)
+    info = (
+        f"collection groups: {len(keep)} of {len(members)} (collection, contrast) groups have >= "
+        f"{GROUP_MIN_SUBJECTS} subjects; {float((col >= 0).float().mean()):.3f} of the images are in one"
+    )
+    return col, len(keep), info
+
+
 def subject_cap_weights(paths: list[str], cap: float, soft: bool = True) -> torch.Tensor:
     """Per-image weights that cap each subject's total draw mass near `cap` images: soft
     (cap * tanh(n / cap) / n, a smooth knee) or hard (min(1, cap / n)). Subjects with n << cap

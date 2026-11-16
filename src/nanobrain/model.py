@@ -227,6 +227,15 @@ class ViTMAE3D(nn.Module):
         # gdist_clean: z pools the clean visible tokens only (unified label 0), as the eval embedding is clean
         gdist_std: bool = False,
         gdist_clean: bool = False,
+        # collection-aware variants (round 17; all off = everything above, bitwise). Both read each image's
+        # (collection, contrast) group from train.py's fino meta column 7 (-1 = no group: fewer than 20 subjects):
+        # gdist_center=collection: z is centred by the EMA mean of its group (stop-grad) instead of the batch mean,
+        #   so the site / scanner part that two scans of one subject always share no longer raises their cosine
+        # cmm_weight: collection mean matching: each pooled vector is pushed against its group's EMA offset from its
+        #   contrast's EMA mean (minus the offset's part along the EMA age direction), over the EMA variance: a
+        #   gradient step on the between-collection share of the pooled embedding's variance
+        gdist_center: str = "batch",
+        cmm_weight: float = 0.0,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -496,6 +505,14 @@ class ViTMAE3D(nn.Module):
         self.xlat_weight, self.gdist_weight, self.gdist_pairs = float(xlat_weight), float(gdist_weight), gdist_pairs
         assert gdist_pairs in ("sample", "subject", "subject_nodup"), "gdist_pairs: sample | subject | subject_nodup"
         self.gdist_std, self.gdist_clean = bool(gdist_std), bool(gdist_clean)
+        assert gdist_center in ("batch", "collection"), "gdist_center: batch | collection"
+        assert gdist_center == "batch" or (self.gdist_weight and gdist_pairs != "sample" and not gdist_clean), (
+            "gdist_center=collection: gdist with subject pairs, all visible tokens"
+        )
+        self.gdist_center, self.cmm_weight = gdist_center, float(cmm_weight)
+        # EMA state of the collection objectives: plain tensors (not parameters or buffers, not in checkpoints);
+        # n_groups is set by train.py
+        self._grp, self.n_groups = None, 0
         self.xlat_head = self.gdist_pred = None
         with torch.random.fork_rng(devices=[]):
             if self.xlat_weight:
@@ -1818,8 +1835,10 @@ class ViTMAE3D(nn.Module):
         )
         if self.training and any(h is not None for h in aux_on):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
-        if self.training and (self.xlat_head is not None or self.gdist_pred is not None):
-            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids)
+        if self.training and (self.xlat_head is not None or self.gdist_pred is not None or self.cmm_weight):
+            loss = loss + self.obj_losses(
+                parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids, fino_meta=fino_meta
+            )
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
@@ -2305,13 +2324,76 @@ class ViTMAE3D(nn.Module):
         self.aux_stats = stats
         return loss
 
+    @torch.no_grad()
+    def _group_step(self, parts: list[dict], tokens: Tensor, S: int, fino_meta: Tensor | None, stats: dict) -> dict:
+        # round 17 (gdist_center=collection, cmm_weight): EMA means of the pooled vector (mean visible token, as
+        # gdist and fino pool it) per (collection, contrast) group and per contrast, an EMA age direction and an
+        # EMA variance around the contrast means. Returns each row's PRE-update values (a row never sees its own
+        # contribution), then folds this batch in. No host sync.
+        assert fino_meta is not None and fino_meta.shape[1] > 7, "gdist_center / cmm: fino meta column 7 (train.py)"
+        assert self.n_groups > 0, "gdist_center / cmm: n_groups (train.py)"
+        rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(S)
+        meta = fino_meta.cpu()[rows][:, [0, 6, 7]]
+        dev = tokens.device
+        if dev.type == "cuda":
+            meta = meta.pin_memory().to(dev, non_blocking=True)
+        z = tokens.float().mean(1)
+        R, D = z.shape
+        if self._grp is None:
+            self._grp = {
+                "g": torch.zeros(self.n_groups, D, device=dev), "gn": torch.zeros(self.n_groups, device=dev),
+                "s": torch.zeros(5, D, device=dev), "sn": torch.zeros(5, device=dev),
+                "age": torch.zeros(D, device=dev), "var": torch.zeros((), device=dev), "k": 0,
+            }
+        st = self._grp
+        age, seq, gid = meta[:, 0], meta[:, 1], meta[:, 2]
+        gi = torch.nan_to_num(gid, nan=-1.0).long()
+        gok = gi >= 0
+        gi = gi.clamp_min(0)
+        si = torch.nan_to_num(seq, nan=4.0).long().clamp(0, 4)
+        seen = (gok & (st["gn"][gi] > 0)).float()
+        gmean = st["g"][gi]
+        off = (gmean - st["s"][si]) * seen[:, None]
+        u = st["age"] / st["age"].norm().clamp_min(1e-6)
+        delta = off - (off @ u)[:, None] * u
+        var = st["var"].clone()
+        out = {"seen": seen, "gmean": gmean, "delta": delta, "var": var}
+        # the between-group share of the pooled variance over this batch's rows (the site-share proxy), logged
+        stats["grp_seen"] = seen.mean()
+        stats["grp_share"] = (off.pow(2).sum(-1) * seen).sum() / seen.sum().clamp_min(1.0) / var.clamp_min(1e-6)
+
+        def fold(mean: Tensor, n: Tensor, idx: Tensor, w: Tensor, m: float):
+            cnt = torch.zeros_like(n).index_add_(0, idx, w)
+            sums = torch.zeros_like(mean).index_add_(0, idx, z * w[:, None])
+            pres = (cnt > 0).float()
+            n_new = n + pres
+            # per occurrence: the running average of the first 1 / (1 - m) occurrences, then an EMA with factor m
+            a = pres * torch.clamp(1.0 / n_new.clamp_min(1.0), min=1.0 - m)
+            mean.add_(a[:, None] * (sums / cnt.clamp_min(1.0)[:, None] - mean))
+            n.copy_(n_new)
+
+        fold(st["g"], st["gn"], gi, gok.float(), 0.9)
+        fold(st["s"], st["sn"], si, torch.ones(R, device=dev), 0.99)
+        res = z - st["s"][si]
+        known = ~torch.isnan(age)
+        g_age = (res * torch.nan_to_num(age, nan=0.0)[:, None]).sum(0) / known.sum().clamp_min(1)
+        v = res.pow(2).sum(-1).mean()
+        b = 0.0 if st["k"] == 0 else 0.99
+        st["var"].mul_(b).add_((1.0 - b) * v)
+        st["age"].mul_(b).add_((1.0 - b) * g_age)
+        st["k"] += 1
+        return out
+
     def obj_losses(
         self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int,
-        subject_ids: Tensor | None = None,
+        subject_ids: Tensor | None = None, fino_meta: Tensor | None = None,
     ) -> Tensor:
         # the objective-round losses (training only); stats merged into self.aux_stats
         loss, stats = embeds.new_zeros((), dtype=torch.float32), {}
         tokens = embeds[:, self.class_tokens :]
+        grp = None
+        if self.gdist_center == "collection" or self.cmm_weight:
+            grp = self._group_step(parts, tokens, S, fino_meta, stats)
         if self.xlat_head is not None:
             assert S == 2, "xlat: num_samples 2"
             # every group at once: batch-unique token ids (image offsets in row order), one lookup table per
@@ -2342,7 +2424,12 @@ class ViTMAE3D(nn.Module):
                 z = (tokens.float() * keep).sum(1) / keep.sum(1).clamp_min(1.0)
             else:
                 z = tokens.float().mean(1)
-            z = z - z.mean(0, keepdim=True).detach()
+            if self.gdist_center == "collection":
+                # round 17: centred by the stop-grad EMA mean of the row's (collection, contrast) group; rows without
+                # a group, or whose group was not seen before this step, keep the batch centring
+                z = torch.where(grp["seen"][:, None] > 0, z - grp["gmean"], z - z.mean(0, keepdim=True).detach())
+            else:
+                z = z - z.mean(0, keepdim=True).detach()
             if self.gdist_std:
                 z = z / z.std(0, keepdim=True).detach().clamp_min(1e-3)
             valid = None
@@ -2369,6 +2456,12 @@ class ViTMAE3D(nn.Module):
             loss = loss + self.gdist_weight * gd
             stats["gdist_loss"] = gd.detach()
             stats["gdist_cos"] = F.cosine_similarity(z, z[partner], dim=-1).mean().detach()
+        if self.cmm_weight:
+            # round 17: d/dz of this term is 2 delta / (R var), a descent step on sum_g p_g |offset_g|^2 / var
+            pooled = tokens.float().mean(1)
+            cm = 2.0 * (pooled * grp["delta"]).sum() / (pooled.shape[0] * grp["var"].clamp_min(1e-6))
+            loss = loss + self.cmm_weight * cm
+            stats["cmm_loss"] = cm.detach()
         self.aux_stats = {**getattr(self, "aux_stats", {}), **stats}
         return loss
 
