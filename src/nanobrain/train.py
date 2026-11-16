@@ -342,8 +342,11 @@ def main(args: DictConfig):
     # every model creation), so a resumed run pulls toward the same values
     init_pull = None
     if args.get("natinit") and args.natinit.enabled and args.natinit.get("wd_to_init", False):
-        init_pull = InitPull(model_without_ddp, optimizer)
-        logger.info(f"natinit wd_to_init: {init_pull.numel / 1e6:.1f}M params in {len(init_pull.init)} tensors")
+        if float(args.natinit.get("wd_to_init_mult", 1.0)) == 0.0:
+            logger.info("natinit wd_to_init_mult 0: no weight decay on the pretrained muon matrices, no pull")
+        else:
+            init_pull = InitPull(model_without_ddp, optimizer)
+            logger.info(f"natinit wd_to_init: {init_pull.numel / 1e6:.1f}M params in {len(init_pull.init)} tensors")
 
     # load checkpoint/resume training
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
@@ -867,9 +870,15 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     # natinit.layer_decay: layer-wise lr decay on top (block i of depth d gets
     # block_lr_mult * layer_decay ** (d - 1 - i); the final norm keeps block_lr_mult). 1.0 = off
     block_mult, layer_decay, depth = 1.0, 1.0, len(model.blocks)
+    # natinit.wd_to_init_mult (only with wd_to_init): strength of the decay toward the natural-image values, as a
+    # multiple of the weight decay, on the pretrained muon matrices. 1.0 = off (the same groups as before);
+    # 0 = no decay on those matrices and no pull
+    init_mult = 1.0
     if args.get("natinit") and args.natinit.enabled:
         block_mult = float(args.natinit.block_lr_mult)
         layer_decay = float(args.natinit.get("layer_decay", 1.0))
+        if args.natinit.get("wd_to_init", False):
+            init_mult = float(args.natinit.get("wd_to_init_mult", 1.0))
     from nanobrain.natinit import is_natinit_param
 
     def lr_mult_fn(name):
@@ -881,19 +890,22 @@ def make_optimizer(args: DictConfig, model: nn.Module):
 
     adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names), lr_mult_fn=lr_mult_fn)
     params = dict(model.named_parameters())
+    def wd_mult_fn(name):
+        return init_mult if is_natinit_param(name) else 1.0
+
     muon_groups = []
-    for mult in sorted({lr_mult_fn(n) for n in muon_names}):
+    for mult, wd_mult in sorted({(lr_mult_fn(n), wd_mult_fn(n)) for n in muon_names}):
         muon_groups.append(
             {
-                "params": [params[n] for n in muon_names if lr_mult_fn(n) == mult],
+                "params": [params[n] for n in muon_names if (lr_mult_fn(n), wd_mult_fn(n)) == (mult, wd_mult)],
                 "lr_multiplier": args.muon_lr_mult * mult,
-                "wd_multiplier": 1.0,
+                "wd_multiplier": wd_mult,
             }
         )
-    if block_mult != 1.0 or layer_decay != 1.0:
+    if block_mult != 1.0 or layer_decay != 1.0 or init_mult != 1.0:
         logger.info(
-            f"natinit block_lr_mult {block_mult} layer_decay {layer_decay}: muon groups "
-            f"{[(len(g['params']), g['lr_multiplier']) for g in muon_groups]}, adamw groups "
+            f"natinit block_lr_mult {block_mult} layer_decay {layer_decay} wd_to_init_mult {init_mult}: muon groups "
+            f"{[(len(g['params']), g['lr_multiplier'], g['wd_multiplier']) for g in muon_groups]}, adamw groups "
             f"{[(len(g['params']), g['lr_multiplier']) for g in adamw_groups]}"
         )
     for groups in (adamw_groups, muon_groups):
