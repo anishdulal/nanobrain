@@ -440,6 +440,14 @@ def main(args: DictConfig):
         sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed, nodup=gdist_nodup)
         logger.info(f"gdist subject pairs: batch images 2k, 2k + 1 share a subject (nodup {gdist_nodup})")
     fast_prep = not args.native
+    # round 17 (off when unset): intensity_norm=rank runs in the loader workers' clip step (prep.clip_batch)
+    inorm = {}
+    if args.model_kwargs.get("intensity_norm", "zscore") == "rank":
+        assert not fast_prep and (args.get("native_batched_prep") or args.get("native_worker_clip")), (
+            "intensity_norm=rank: native training with the workers' clip step"
+        )
+        inorm = {"intensity_norm": "rank"}
+        logger.info("intensity_norm rank: in-mask values -> N(0, 1) quantiles of their mid-ranks (loader workers)")
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -450,9 +458,10 @@ def main(args: DictConfig):
             functools.partial(
                 prep.native_concat, clip_quantiles=tuple(args.clip_quantiles),
                 **({"orient": True} if args.get("native_worker_orient") or args.get("native_sparse_tokens") else {}),
+                **inorm,
             )
             if args.get("native_batched_prep")
-            else functools.partial(prep.clip_batch, clip_quantiles=tuple(args.clip_quantiles))
+            else functools.partial(prep.clip_batch, clip_quantiles=tuple(args.clip_quantiles), **inorm)
             if args.get("native_worker_clip") else list
         ) if not fast_prep else functools.partial(
             prep.plan_batch,

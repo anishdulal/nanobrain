@@ -44,18 +44,78 @@ def int16_clip(values: np.ndarray, scale: float, clip_quantiles=(0.005, 0.995)):
     return float(low), float(high)
 
 
-def clip_batch(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> list[dict]:
+# model_kwargs.intensity_norm=rank (round 17, off by default): every image's in-mask values are replaced by the N(0, 1)
+# quantile of their mid-rank (ties share one value), stored as int16 codes x RANK_SCALE. The eval path does the same
+# on the gpu (model.rank_gaussianize, rounded to the same codes); the usual clip + z-score then runs on the result
+RANK_SCALE = 1.0 / 4096.0
+
+
+def rank_int16(values: np.ndarray) -> np.ndarray:
+    """In-mask values -> int16 codes of the N(0, 1) quantiles of their mid-ranks: p = (C - c / 2) / n for a level
+    with c voxels and inclusive cumulative count C."""
+    from scipy.special import ndtri
+
+    n = len(values)
+    if values.dtype == np.int16:
+        levels = values.view(np.uint16) ^ np.uint16(0x8000)
+        counts = np.bincount(levels, minlength=65536)
+        p = (np.cumsum(counts) - 0.5 * counts) / n
+        lut = np.clip(np.round(ndtri(np.clip(p, 0.5 / n, 1.0 - 0.5 / n)) / RANK_SCALE), -32767, 32767).astype(np.int16)
+        return lut[levels]
+    _, inv, counts = np.unique(values, return_inverse=True, return_counts=True)
+    p = (np.cumsum(counts) - 0.5 * counts) / n
+    return np.clip(np.round(ndtri(p) / RANK_SCALE), -32767, 32767).astype(np.int16)[inv.reshape(-1)]
+
+
+def rank_gaussianize(values: Tensor) -> Tensor:
+    """The eval path of intensity_norm=rank (float values, any device): rank_int16's codes x RANK_SCALE."""
+    n = values.numel()
+    _, inv, counts = torch.unique(values, sorted=True, return_inverse=True, return_counts=True)
+    counts = counts.double()
+    p = ((counts.cumsum(0) - 0.5 * counts) / n).clamp(0.5 / n, 1.0 - 0.5 / n)
+    z = math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)
+    z = torch.round(z / RANK_SCALE).clamp(-32767, 32767) * RANK_SCALE
+    return z[inv].to(values.dtype)
+
+
+def rank_int16_clip(values: np.ndarray, clip_quantiles=(0.005, 0.995)) -> tuple[np.ndarray, tuple | None]:
+    """rank_int16 plus int16_clip of its codes from ONE histogram (the map is monotone, so the code at a rank is the
+    map of the level at that rank): the same codes and thresholds as int16_clip(rank_int16(v), RANK_SCALE)."""
+    if values.dtype != np.int16:
+        codes = rank_int16(values)
+        return codes, int16_clip(codes, RANK_SCALE, clip_quantiles)
+    from scipy.special import ndtri
+
+    n = len(values)
+    levels = values.view(np.uint16) ^ np.uint16(0x8000)
+    counts = np.bincount(levels, minlength=65536)
+    cum = np.cumsum(counts)
+    p = (cum - 0.5 * counts) / n
+    lut = np.clip(np.round(ndtri(np.clip(p, 0.5 / n, 1.0 - 0.5 / n)) / RANK_SCALE), -32767, 32767).astype(np.int16)
+    last = n - 1
+    at = np.searchsorted(cum, [round(clip_quantiles[0] * last), round(clip_quantiles[1] * last)], side="right")
+    low, high = lut[at].astype(np.float32) * np.float32(RANK_SCALE)
+    return lut[levels], (float(low), float(high))
+
+
+def clip_batch(batch: list[dict], clip_quantiles=(0.005, 0.995), intensity_norm: str = "zscore") -> list[dict]:
     # native loader collate_fn (native_worker_clip): only the int16 histogram clip thresholds, in the workers
     for sample in batch:
+        if intensity_norm == "rank":
+            codes, sample["clip"] = rank_int16_clip(sample["values"].numpy(), clip_quantiles)
+            sample["values"], sample["scale"] = torch.from_numpy(codes), RANK_SCALE
+            continue
         sample["clip"] = int16_clip(sample["values"].numpy(), sample["scale"], clip_quantiles)
     return batch
 
 
-def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995), orient: bool = False) -> dict | list[dict]:
+def native_concat(
+    batch: list[dict], clip_quantiles=(0.005, 0.995), orient: bool = False, intensity_norm: str = "zscore"
+) -> dict | list[dict]:
     # native loader collate_fn (native_batched_prep): clip_batch, then one int16 values and one run length
     # tensor per batch (+ per sample scale, clip, lengths), so the gpu prep runs batch wide in
     # native_batch_transform. falls back to the per sample list when a sample has no int16 clip
-    batch = clip_batch(batch, clip_quantiles)
+    batch = clip_batch(batch, clip_quantiles, intensity_norm)
     if any(s["clip"] is None for s in batch) or len({(s["values"].dtype, s["mask_rle"].dtype) for s in batch}) > 1:
         return batch
     for s in batch:

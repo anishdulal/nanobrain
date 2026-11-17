@@ -236,6 +236,16 @@ class ViTMAE3D(nn.Module):
         #   gradient step on the between-collection share of the pooled embedding's variance
         gdist_center: str = "batch",
         cmm_weight: float = 0.0,
+        # cmm_mode: ema = round 17a's offsets (stale EMA group means minus fresh EMA contrast means: under a global drift
+        #   of the representation they point along the drift, and the push then amplifies it; kept so the R17a runs
+        #   reproduce); resid = each step's residuals from THAT step's in-batch contrast means, averaged per group over
+        #   occurrences (momentum 0.99, so a global drift cancels), the push ramped in with fino's gamma schedule
+        cmm_mode: str = "ema",
+        # input intensity standardisation (round 17, model preprocessing, the same in training and eval): zscore =
+        # clip + z-score in the brain mask (unchanged); rank = first every in-mask value -> the N(0, 1) quantile of
+        # its mid-rank (prep.rank_int16 in the loader workers, prep.rank_gaussianize in transform_cuda), which makes
+        # the input invariant to any global monotonic intensity change (scanner / sequence contrast curves)
+        intensity_norm: str = "zscore",
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -510,6 +520,12 @@ class ViTMAE3D(nn.Module):
             "gdist_center=collection: gdist with subject pairs, all visible tokens"
         )
         self.gdist_center, self.cmm_weight = gdist_center, float(cmm_weight)
+        assert cmm_mode in ("ema", "resid"), "cmm_mode: ema | resid"
+        self.cmm_mode = cmm_mode
+        # the cmm ramp (resid): fino's gamma / its gamma_max, 0 -> 1 over training (fino's sigmoid schedule)
+        self._cmm_gmax = float(fino3d["gamma_max"]) if fino3d else 0.0
+        assert intensity_norm in ("zscore", "rank"), "intensity_norm: zscore | rank"
+        self.intensity_norm = intensity_norm
         # EMA state of the collection objectives: plain tensors (not parameters or buffers, not in checkpoints);
         # n_groups is set by train.py
         self._grp, self.n_groups = None, 0
@@ -1837,7 +1853,8 @@ class ViTMAE3D(nn.Module):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
         if self.training and (self.xlat_head is not None or self.gdist_pred is not None or self.cmm_weight):
             loss = loss + self.obj_losses(
-                parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids, fino_meta=fino_meta
+                parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids, fino_meta=fino_meta,
+                fino_gamma=fino_gamma,
             )
         for part in parts:
             part.pop("vis_patches", None)
@@ -2361,6 +2378,30 @@ class ViTMAE3D(nn.Module):
         # the between-group share of the pooled variance over this batch's rows (the site-share proxy), logged
         stats["grp_seen"] = seen.mean()
         stats["grp_share"] = (off.pow(2).sum(-1) * seen).sum() / seen.sum().clamp_min(1.0) / var.clamp_min(1e-6)
+        if getattr(self, "cmm_mode", "ema") == "resid":
+            # residuals from this step's in-batch contrast means over the OTHER images (leave one image out): the same
+            # representation, so no drift term, and the image's own deviation is not shrunk by its own share of the mean
+            ones = torch.ones(R, device=dev)
+            img = rows.to(dev, non_blocking=True)
+            nimg = int(rows.max()) + 1  # rows is on the cpu: no sync
+            scnt = torch.zeros(5, device=dev).index_add_(0, si, ones)
+            ssum = torch.zeros(5, D, device=dev).index_add_(0, si, z)
+            icnt = torch.zeros(nimg, device=dev).index_add_(0, img, ones)
+            isum = torch.zeros(nimg, D, device=dev).index_add_(0, img, z)
+            ocnt = scnt[si] - icnt[img]
+            r = z - (ssum[si] - isum[img]) / ocnt.clamp_min(1.0)[:, None]
+            # a row whose contrast has no other image in the batch has no usable residual
+            rok = gok & (ocnt > 0)
+            if "rg" not in st:
+                st.update({"rg": torch.zeros(self.n_groups, D, device=dev), "rgn": torch.zeros(self.n_groups, device=dev),
+                           "rage": torch.zeros(D, device=dev), "rvar": torch.zeros((), device=dev), "rk": 0})
+            rseen = (rok & (st["rgn"][gi] > 0)).float()
+            roff = st["rg"][gi] * rseen[:, None]
+            ru = st["rage"] / st["rage"].norm().clamp_min(1e-6)
+            rvar = st["rvar"].clone()
+            out.update({"delta": roff - (roff @ ru)[:, None] * ru, "var": rvar, "seen_r": rseen})
+            stats["cmm_seen"] = rseen.mean()
+            stats["cmm_share"] = (roff.pow(2).sum(-1) * rseen).sum() / rseen.sum().clamp_min(1.0) / rvar.clamp_min(1e-6)
 
         def fold(mean: Tensor, n: Tensor, idx: Tensor, w: Tensor, m: float):
             cnt = torch.zeros_like(n).index_add_(0, idx, w)
@@ -2382,11 +2423,27 @@ class ViTMAE3D(nn.Module):
         st["var"].mul_(b).add_((1.0 - b) * v)
         st["age"].mul_(b).add_((1.0 - b) * g_age)
         st["k"] += 1
+        if getattr(self, "cmm_mode", "ema") == "resid":
+            w = rok.float()
+            cnt = torch.zeros_like(st["rgn"]).index_add_(0, gi, w)
+            sums = torch.zeros_like(st["rg"]).index_add_(0, gi, r * w[:, None])
+            pres = (cnt > 0).float()
+            n_new = st["rgn"] + pres
+            a = pres * torch.clamp(1.0 / n_new.clamp_min(1.0), min=0.01)
+            st["rg"].add_(a[:, None] * (sums / cnt.clamp_min(1.0)[:, None] - st["rg"]))
+            st["rgn"].copy_(n_new)
+            known_r = (~torch.isnan(age)) & rok
+            ga = (r * (torch.nan_to_num(age, nan=0.0) * known_r.float())[:, None]).sum(0) / known_r.sum().clamp_min(1)
+            vr = (r.pow(2).sum(-1) * w).sum() / w.sum().clamp_min(1.0)
+            b2 = 0.0 if st["rk"] == 0 else 0.99
+            st["rvar"].mul_(b2).add_((1.0 - b2) * vr)
+            st["rage"].mul_(b2).add_((1.0 - b2) * ga)
+            st["rk"] += 1
         return out
 
     def obj_losses(
         self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int,
-        subject_ids: Tensor | None = None, fino_meta: Tensor | None = None,
+        subject_ids: Tensor | None = None, fino_meta: Tensor | None = None, fino_gamma: float = 0.0,
     ) -> Tensor:
         # the objective-round losses (training only); stats merged into self.aux_stats
         loss, stats = embeds.new_zeros((), dtype=torch.float32), {}
@@ -2460,7 +2517,11 @@ class ViTMAE3D(nn.Module):
             # round 17: d/dz of this term is 2 delta / (R var), a descent step on sum_g p_g |offset_g|^2 / var
             pooled = tokens.float().mean(1)
             cm = 2.0 * (pooled * grp["delta"]).sum() / (pooled.shape[0] * grp["var"].clamp_min(1e-6))
-            loss = loss + self.cmm_weight * cm
+            ramp = 1.0
+            if getattr(self, "cmm_mode", "ema") == "resid":
+                ramp = min(max(float(fino_gamma) / self._cmm_gmax, 0.0), 1.0) if self._cmm_gmax > 0 else 1.0
+                stats["cmm_ramp"] = torch.tensor(ramp)
+            loss = loss + self.cmm_weight * ramp * cm
             stats["cmm_loss"] = cm.detach()
         self.aux_stats = {**getattr(self, "aux_stats", {}), **stats}
         return loss
@@ -2517,6 +2578,10 @@ class ViTMAE3D(nn.Module):
         values = sample["values"]
         mask = sample["mask"]
         affine = sample["affine"]
+        if getattr(self, "intensity_norm", "zscore") == "rank":
+            from .prep import rank_gaussianize
+
+            values = rank_gaussianize(values)
         values = normalize_values(values, self.clip_quantiles)
         image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
         image, mask, affine = reorient_to_ras(image, mask, affine)
