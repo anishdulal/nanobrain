@@ -274,6 +274,17 @@ def main(args: DictConfig):
     else:
         loss_scaler = None
 
+    # natinit.wd_to_init (ours; off unless set): the pretrained encoder matrices decay toward their natural-image
+    # values instead of toward zero. the copies are taken here, before a resume overwrites the weights (natinit runs at
+    # every model creation), so a resumed run pulls toward the same values
+    init_pull = None
+    if args.get("natinit") and args.natinit.enabled and args.natinit.get("wd_to_init", False):
+        if float(args.natinit.get("wd_to_init_mult", 1.0)) == 0.0:
+            logger.info("natinit wd_to_init_mult 0: no weight decay on the pretrained muon matrices, no pull")
+        else:
+            init_pull = InitPull(model_without_ddp, optimizer)
+            logger.info(f"natinit wd_to_init: {init_pull.numel / 1e6:.1f}M params in {len(init_pull.init)} tensors")
+
     # load checkpoint/resume training
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
@@ -317,6 +328,38 @@ def main(args: DictConfig):
             f"subject cap sampling: cap {args.subject_cap} soft {args.get('subject_cap_soft', True)}, "
             f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
+        )
+    if args.get("collection_temper"):
+        # ours (off when unset): each collection's total draw mass m -> m^(1 - alpha), on the weights above
+        from nanobrain.data import collection_keys
+
+        colls = collection_keys(dataset.paths)
+        w = sampler.weights if sampler.weights is not None else torch.ones(len(dataset), dtype=torch.float64)
+        mass: dict[str, float] = {}
+        for coll, wi in zip(colls, w.tolist()):
+            mass[coll] = mass.get(coll, 0.0) + wi
+        alpha = float(args.collection_temper)
+        sampler.weights = w * torch.tensor([mass[c] ** -alpha for c in colls], dtype=torch.float64)
+
+        def n_coll(m: dict[str, float]) -> float:
+            return sum(m.values()) ** 2 / sum(v * v for v in m.values())
+
+        logger.info(
+            f"collection tempered sampling: alpha {alpha}, effective collections "
+            f"{n_coll(mass):.1f} -> {n_coll({c: v ** (1.0 - alpha) for c, v in mass.items()}):.1f} of {len(mass)}"
+        )
+    if args.get("young_boost"):
+        # ours (off when unset): images of subjects younger than young_age years (fino3d ages; masked or missing ages
+        # count as adult) get their draw weight x young_boost, on the weights above
+        assert fino_meta is not None, "young_boost: needs fino3d (the per-image ages)"
+        age = fino_meta[:, 0].double() * float(args.fino3d.age_std) + float(args.fino3d.age_mean)
+        young = torch.nan_to_num(age, nan=1e9) < float(args.get("young_age") or 18.0)
+        w = sampler.weights if sampler.weights is not None else torch.ones(len(dataset), dtype=torch.float64)
+        before = float(w[young].sum() / w.sum())
+        sampler.weights = torch.where(young, w * float(args.young_boost), w)
+        logger.info(
+            f"young boost: x{float(args.young_boost)} below age {float(args.get('young_age') or 18.0)} "
+            f"({int(young.sum())} images): draw share {before:.3f} -> {float(sampler.weights[young].sum() / sampler.weights.sum()):.3f}"
         )
     if args.get("native_bucket_window"):
         # speed, CHANGES BATCH COMPOSITION (off when unset): windows of native_bucket_window batches sorted by
@@ -417,6 +460,7 @@ def main(args: DictConfig):
         batch_flops,
         stop_event,
         native_cudagraphs,
+        init_pull=init_pull,
     )
 
     if args.distributed:
@@ -473,6 +517,7 @@ def train(
     batch_flops: float,
     stop_event: threading.Event,
     native_cudagraphs: bool = False,
+    init_pull: "InitPull | None" = None,
 ) -> dict:
     model.train()
 
@@ -667,6 +712,9 @@ def train(
         if not need_update:
             continue
         step += 1
+        if init_pull is not None:
+            # right after this step's optimizer update
+            init_pull.apply()
         if args.gc_freeze and step == start_step + 1:
             # compile is done: later gen 2 collections skip the startup objects
             gc.collect()
@@ -734,9 +782,14 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     # natinit.layer_decay: layer-wise lr decay on top (block i of depth d gets
     # block_lr_mult * layer_decay ** (d - 1 - i); the final norm keeps block_lr_mult). 1.0 = off
     block_mult, layer_decay, depth = 1.0, 1.0, len(model.blocks)
+    # natinit.wd_to_init_mult (ours; only with wd_to_init): strength of the decay toward the natural-image values, as
+    # a multiple of the weight decay, on the pretrained muon matrices. 1.0 = the same groups as without it
+    init_mult = 1.0
     if args.get("natinit") and args.natinit.enabled:
         block_mult = float(args.natinit.block_lr_mult)
         layer_decay = float(args.natinit.get("layer_decay", 1.0))
+        if args.natinit.get("wd_to_init", False):
+            init_mult = float(args.natinit.get("wd_to_init_mult", 1.0))
     from nanobrain.natinit import is_natinit_param
 
     def lr_mult_fn(name):
@@ -748,19 +801,22 @@ def make_optimizer(args: DictConfig, model: nn.Module):
 
     adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names), lr_mult_fn=lr_mult_fn)
     params = dict(model.named_parameters())
+    def wd_mult_fn(name):
+        return init_mult if is_natinit_param(name) else 1.0
+
     muon_groups = []
-    for mult in sorted({lr_mult_fn(n) for n in muon_names}):
+    for mult, wd_mult in sorted({(lr_mult_fn(n), wd_mult_fn(n)) for n in muon_names}):
         muon_groups.append(
             {
-                "params": [params[n] for n in muon_names if lr_mult_fn(n) == mult],
+                "params": [params[n] for n in muon_names if (lr_mult_fn(n), wd_mult_fn(n)) == (mult, wd_mult)],
                 "lr_multiplier": args.muon_lr_mult * mult,
-                "wd_multiplier": 1.0,
+                "wd_multiplier": wd_mult,
             }
         )
-    if block_mult != 1.0 or layer_decay != 1.0:
+    if block_mult != 1.0 or layer_decay != 1.0 or init_mult != 1.0:
         logger.info(
-            f"natinit block_lr_mult {block_mult} layer_decay {layer_decay}: muon groups "
-            f"{[(len(g['params']), g['lr_multiplier']) for g in muon_groups]}, adamw groups "
+            f"natinit block_lr_mult {block_mult} layer_decay {layer_decay} wd_to_init_mult {init_mult}: muon groups "
+            f"{[(len(g['params']), g['lr_multiplier'], g['wd_multiplier']) for g in muon_groups]}, adamw groups "
             f"{[(len(g['params']), g['lr_multiplier']) for g in adamw_groups]}"
         )
     for groups in (adamw_groups, muon_groups):
@@ -781,6 +837,51 @@ def make_optimizer(args: DictConfig, model: nn.Module):
 def ignore_sigterm(worker_id: int):
     # `timeout` signals the whole process group. workers keep loading until the main process exits
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+class InitPull:
+    """natinit.wd_to_init (ours): decoupled weight decay toward the natural-image init (L2-SP), pretrained encoder only.
+
+    Muon and AdamW decay each parameter as p <- p (1 - lr wd) inside their step. After each update this adds
+    lr wd p0 back to every pretrained parameter (p0: its value after natinit), so together the step decays p - p0
+    instead of p: p <- p - lr wd (p - p0) - lr update. lr and wd are read from the parameter's current optimizer
+    group at apply time, so block_lr_mult and layer_decay apply as they do to the decay itself. Parameters without
+    weight decay (biases, norms, gammas) are skipped, as the optimizers skip them. Costs one fp32 copy of each
+    pretrained matrix (~85M params on ViT-B) and one foreach add per step."""
+
+    def __init__(self, model: nn.Module, optimizer):
+        from nanobrain.natinit import is_natinit_param
+
+        self.optimizer = optimizer
+        name_of = {id(p): n for n, p in model.named_parameters()}
+        self.init = {}  # id(param) -> fp32 copy of its natinit value
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                if group.get("wd_multiplier", 1.0) == 0.0:
+                    continue
+                for p in group["params"]:
+                    if is_natinit_param(name_of.get(id(p), "")):
+                        assert p.dtype == torch.float32, "wd_to_init: fp32 parameters only"
+                        self.init[id(p)] = p.detach().clone()
+        assert self.init, "wd_to_init: no pretrained parameter with weight decay"
+        self.numel = sum(t.numel() for t in self.init.values())
+        self.plan = None
+
+    @torch.no_grad()
+    def apply(self):
+        if self.plan is None:
+            # bound at the first step, to the optimizer's CURRENT groups: a resume's load_state_dict replaces the
+            # group dicts, and update_lr writes the per-step lr into the new ones
+            self.plan = []
+            for group in self.optimizer.param_groups:
+                ps = [p for p in group["params"] if id(p) in self.init]
+                if ps:
+                    self.plan.append((group, ps, [self.init[id(p)] for p in ps]))
+            assert sum(len(ps) for _, ps, _ in self.plan) == len(self.init), "wd_to_init: parameters left the groups"
+        for group, params, inits in self.plan:
+            a = group["lr"] * group["weight_decay"]
+            if a:
+                torch._foreach_add_(params, inits, alpha=a)
 
 
 def nice_worker(worker_id: int, nice: int = 0):

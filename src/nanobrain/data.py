@@ -83,6 +83,17 @@ def subject_counts(paths: list[str]) -> tuple[list[str], torch.Tensor]:
     return keys, torch.tensor([counts[key] for key in keys], dtype=torch.float64)
 
 
+def collection_keys(paths: list[str]) -> list[str]:
+    """(ours) Collection of every path: the segments between derivatives/ and the first sub-* segment, e.g.
+    PT030_OpenNeuro/ds001226 or PT035_Yale_Brain_Mets_Longitudinal."""
+    keys = []
+    for path in paths:
+        parts = path.split("/")
+        cut = next((ii for ii, part in enumerate(parts) if part.startswith("sub")), 2)
+        keys.append("/".join(parts[1:cut]))
+    return keys
+
+
 def subject_cap_weights(paths: list[str], cap: float, soft: bool = True) -> torch.Tensor:
     """Per-image weights that cap each subject's total draw mass near `cap` images: soft
     (cap * tanh(n / cap) / n, a smooth knee) or hard (min(1, cap / n)). Subjects with n << cap
