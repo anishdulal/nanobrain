@@ -150,6 +150,9 @@ class ViTMAE3D(nn.Module):
         unified_weight: float = 0.0,
         unified_ratio: float = 0.25,
         unified_shuffle: bool = False,
+        # unified_noswap: tokens drawn for the cross-subject swap class stay clean (no swap, label 0); the
+        # other classes keep their rates, so the corrupted share falls by one class's share
+        unified_noswap: bool = False,
         # edge level-set: the level head construction on the gradient magnitude (central
         # differences per mm on the patch's own voxel grid), thresholds k x the row's in-brain
         # median gradient, level_pool sub-blocks, BCE weighted by brain fraction
@@ -282,6 +285,7 @@ class ViTMAE3D(nn.Module):
         self.unified_weight = float(unified_weight)
         self.unified_ratio = float(unified_ratio)
         self.unified_shuffle = bool(unified_shuffle)
+        self.unified_noswap = bool(unified_noswap)
         self.edgelvl_weight = float(edgelvl_weight)
         self.aux_stats = {}
         self.orient_weight = float(orient_weight)
@@ -962,6 +966,8 @@ class ViTMAE3D(nn.Module):
         ok = vis_mask.float().mean(-1) >= 0.5
         cand, hit = self.corrupt_candidates(ok, self.unified_ratio)
         cls = torch.where(hit, torch.randint(1, self.unified_classes, hit.shape, device=dev), 0)
+        if getattr(self, "unified_noswap", False):
+            cls = torch.where(cls == 1, 0, cls)
         labels = torch.zeros(rows, nv, dtype=torch.long, device=dev).scatter(1, cand, cls)
         if self.unified_shuffle:
             shuf = self.unified_classes - 1
@@ -2039,6 +2045,8 @@ class ViTMAE3D(nn.Module):
             ok = frac[row_img].gather(1, vis_order) >= 0.5
             cand, hit = self.corrupt_candidates(ok, self.unified_ratio)
             cls = torch.where(hit, torch.randint(1, self.unified_classes, hit.shape, device=device), 0)
+            if self.unified_noswap:
+                cls = torch.where(cls == 1, 0, cls)
             labels = torch.zeros_like(vis_order).scatter(1, cand, cls)
             kind = torch.where((cls >= 2) & (cls < 2 + self.corrupt_kinds), cls - 1, 0)
             uni = [t.split(num_rows) for t in (cand, labels, kind)]
